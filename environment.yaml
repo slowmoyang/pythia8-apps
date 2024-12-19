@@ -2,4 +2,11 @@ channels:
   - conda-forge
 dependencies:
   - python=3.11
-  - meson
+  - c-compiler=1.8.0
+  - cxx-compiler=1.8.0
+  - meson=1.6.0
+  - cmake=3.31.2
+  - root=6.32.2
+  - pythia8=8.312
+  - hepmc3=3.3.0
+  - clang-format=19.1.5

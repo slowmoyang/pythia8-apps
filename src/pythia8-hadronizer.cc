@@ -1,21 +1,32 @@
 #include "Pythia8/Pythia.h"
 #include "Pythia8/LHEF3.h"
+#include "Pythia8/PythiaStdlib.h"
 #include "Pythia8Plugins/HepMC3.h"
 #include "Pythia8Plugins/JetMatching.h"
+#include "Pythia8Plugins/aMCatNLOHooks.h"
+
 #include "TFile.h"
 #include "TTree.h"
+
+#include "argparse/argparse.hpp"
+
 #include <algorithm>
 #include <memory>
+#include <exception>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <filesystem>
+#include <cmath>
 
+namespace fs = std::filesystem;
 
-const double pb_to_mb = 1e-9;
-const double mb_to_pb = 1e9;
 
 // Returns the number of events in the input LHE file
-long countEvents(const std::string& input_file) {
-  Pythia8::Reader reader{input_file};
+// Read each event and write them out again, also in reclustered form.
+long countEvents(const std::string& input_file_path) {
+  Pythia8::Reader reader{input_file_path};
   long num_events = 0;
-  // Read each event and write them out again, also in reclustered form.
   while (reader.readEvent()) {
     ++num_events;
   }
@@ -23,156 +34,190 @@ long countEvents(const std::string& input_file) {
 }
 
 
-// Returns an inclusive cross section
-double getMG5CrossSection(Pythia8::Pythia& pythia) {
-  double xsec = 0.;
+// Get the inclusive x-section by summing over all process x-sections.
+double getMG5AMCNLOCrossSection(Pythia8::Pythia& pythia) {
+  double xs = 0.;
   for (int idx = 0; idx < pythia.info.nProcessesLHEF(); ++idx) {
-    xsec += pythia.info.sigmaLHEF(idx);
+    xs += pythia.info.sigmaLHEF(idx);
   }
-  return xsec;
+  return xs;
 }
 
 
 // Returns a weight normalisation factor for Pythia8::Pythia8.info::accumulateXsec
-double getWeightNorm(Pythia8::Pythia& pythia,
-                     const double mg5_xsec_pb,
-                     const int num_events) {
-  const int abs_strategy = std::abs(pythia.info.lhaStrategy());
-  if ((abs_strategy < 1) or (abs_strategy > 4)) {
-    std::cerr << "" << std::endl;
-    return 0.0;
-  }
+// taken from https://github.com/HEPcodes/MG5aMC_PY8_interface/blob/c1b01c2721826ccd6eb0f583d9b6ea77df1a320e/MG5aMC_PY8_interface.cc
+double getEventWeightNormalizer(
+    Pythia8::Pythia& pythia,
+    const double mg5amcnlo_xsecec_pb,
+    const int num_events) {
 
   // https://pythia.org/latest-manual/LHA.html
-  const bool is_weight_in_pb = abs_strategy == 4;
-  const double norm_den = is_weight_in_pb ? 1.0 : mg5_xsec_pb;
-  const double norm = (norm_den * pb_to_mb) / static_cast<double>(num_events);
+  const bool is_weight_in_pb = std::abs(pythia.info.lhaStrategy()) == 4;
+  const double norm_den = is_weight_in_pb ? 1.0 : mg5amcnlo_xsecec_pb;
+  const double norm = (norm_den * Pythia8::PB2MB) / static_cast<double>(num_events);
 
   return norm;
 }
 
-// main
-int main(int argc, char* argv[]) {
-  /////////////////////////////////////////////////////////////////////////////
-  // Check that correct number of command-line arguments
-  /////////////////////////////////////////////////////////////////////////////
-  if (argc != 5) {
-    std::cerr << "got wrong argc=" << argc
-              << std::endl
-              << "usage: " << argv[0] << " CARD_FILE INPUT_FILE OUTPUT_HEPMC_FILE OUTPUT_ROOT_FILE"
-              << std::endl;
+
+// FIXME:
+int getInternalMergingScheme(Pythia8::Pythia& pythia) {
+
+  if (pythia.settings.flag("Merging:doUMEPSTree") or pythia.settings.flag("Merging:doUMEPSSubt")) {
     return 1;
+
+  } else {
+    bool do_unlops = false;
+    do_unlops |= pythia.settings.flag("Merging:doUNLOPSTree");
+    do_unlops |= pythia.settings.flag("Merging:doUNLOPSSubt");
+    do_unlops |= pythia.settings.flag("Merging:doUNLOPSLoop");
+    do_unlops |= pythia.settings.flag("Merging:doUNLOPSSubtNLO");
+
+    if (do_unlops) {
+      return 2;
+
+    } else {
+      return 0;
+
+    }
+  }
+}
+
+
+// Additional PDF/alphaS weight for internal merging.
+// Additional weight due to random choice of reclustered/non-reclustered
+// treatment. Also contains additional sign for subtractive samples.
+double getMergingWeight(
+    Pythia8::Pythia& pythia,
+    std::shared_ptr<Pythia8::amcnlo_unitarised_interface> merging_hook) {
+  double merging_weight = pythia.info.mergingWeightNLO();
+  if (merging_hook.get()) {
+    merging_weight = merging_hook->getNormFactor();
+  }
+  return merging_weight;
+}
+
+
+void run(
+    const fs::path input_file_path,
+    const fs::path card_file_path,
+    const fs::path output_file_path,
+    const int max_events,
+    const bool store_djr
+) {
+  if (not fs::exists(input_file_path)) {
+    throw std::runtime_error(std::string{"file not found: "} + input_file_path.c_str());
   }
 
-  const std::string card_file{argv[1]};
-  const std::string input_file{argv[2]};
-  const std::string output_hepmc_file{argv[3]};
-  const std::string output_root_file{argv[4]};
+  if (not fs::exists(card_file_path)) {
+    throw std::runtime_error(std::string{"file not found: "} + card_file_path.c_str());
+  }
 
-  std::cout << "- input_file: " << input_file << std::endl
-            << "- card_file: " << card_file << std::endl
-            << "- output_hepmc_file: " << output_hepmc_file << std::endl
-            << "- output_root_file: " << output_root_file << std::endl;
+  if (fs::exists(output_file_path)) {
+    throw std::runtime_error(std::string{"file already exists: "} + output_file_path.c_str());
+  }
 
   /////////////////////////////////////////////////////////////////////////////
   // Pythia
   /////////////////////////////////////////////////////////////////////////////
-
   Pythia8::Pythia pythia{};
+
   pythia.readString("Beams:frameType = 4");
-  pythia.settings.word("Beams:LHEF", input_file);
-  pythia.readFile(card_file, 0);
-  pythia.readString("Weights:suppressAUX = on");
+  pythia.settings.word("Beams:LHEF", input_file_path.c_str());
+  pythia.readFile(card_file_path.c_str(), 0);
 
   /////////////////////////////////////////////////////////////////////////////
   // Pythia8ToHepMC
   /////////////////////////////////////////////////////////////////////////////
 
-  Pythia8::Pythia8ToHepMC writer{output_hepmc_file};
+  Pythia8::Pythia8ToHepMC hepmc_writer{output_file_path.c_str()};
   // Switch off warnings for parton-level events.
-  writer.set_print_inconsistency(false);
-  writer.set_free_parton_warnings(false);
-  // Do not store the following information.
-  writer.set_store_pdf(false);
-  writer.set_store_proc(false);
+  hepmc_writer.set_print_inconsistency(false);
+  hepmc_writer.set_free_parton_warnings(false);
 
   /////////////////////////////////////////////////////////////////////////////
+  // NOTE: Jet Matching and Merging
   //
+  // adapted from main89.cc in pythia8 examples
   /////////////////////////////////////////////////////////////////////////////
+  const bool do_matching = pythia.settings.flag("JetMatching:merge");
+  const bool do_merging = pythia.settings.word("Merging:Process") != "void";
 
-  auto jet_matching = std::make_shared<Pythia8::JetMatchingMadgraph>();
-  if (pythia.settings.flag("JetMatching:merge")) {
-    pythia.setUserHooksPtr(jet_matching);
+  if (do_matching and do_merging) {
+    throw std::runtime_error("both matching and merging are used");
+  }
+
+  std::shared_ptr<Pythia8::JetMatchingMadgraph> matching_hook = nullptr;
+  if (do_matching) {
+    matching_hook = std::make_shared<Pythia8::JetMatchingMadgraph>();
+    pythia.setUserHooksPtr(matching_hook);
+  }
+
+  // NOTE: djr
+  std::shared_ptr<TFile> djr_file = nullptr;
+  std::shared_ptr<TTree> djr_tree = nullptr;
+  std::vector<double> djr_vec;
+  int djr_num_jets;
+  double djr_weight;
+
+  if (do_matching and store_djr) {
+    const std::string djr_file_name = output_file_path.stem().c_str() + std::string{"_djr.root"};
+    const fs::path djr_file_path = output_file_path.parent_path() / djr_file_name;
+
+    djr_file = std::make_shared<TFile>(djr_file_path.c_str(), "RECREATE");
+    djr_tree = std::make_shared<TTree>("tree", "tree");
+    djr_tree->SetDirectory(djr_file.get());
+
+    djr_tree->Branch("djr", "vector<double>", &djr_vec);
+    djr_tree->Branch("weight", &djr_weight);
+    djr_tree->Branch("num_jets", &djr_num_jets);
+  }
+
+  std::shared_ptr<Pythia8::amcnlo_unitarised_interface> merging_hook = nullptr;
+  if (do_merging) {
+    // Allow to set the number of addtional partons dynamically.
+    // Store merging scheme.
+    const int scheme = getInternalMergingScheme(pythia);
+    merging_hook = std::make_shared<Pythia8::amcnlo_unitarised_interface>(scheme);
+    pythia.setUserHooksPtr(merging_hook);
+
   }
 
   /////////////////////////////////////////////////////////////////////////////
   //
   /////////////////////////////////////////////////////////////////////////////
 
-  TFile djr_file{output_root_file.c_str(), "RECREATE"};
-  TTree djr_tree{"tree", "tree"};
-  djr_tree.SetDirectory(&djr_file);
-
-  std::vector<double> djr_vec;
-  int djr_num_jets;
-  double djr_weight;
-  djr_tree.Branch("djr", "vector<double>", &djr_vec);
-  djr_tree.Branch("weight", &djr_weight);
-  djr_tree.Branch("num_jets", &djr_num_jets);
-
-  /////////////////////////////////////////////////////////////////////////////
-  //
-  /////////////////////////////////////////////////////////////////////////////
-
-  // the number of events in the input LHE file
-  const long num_events = countEvents(input_file);
-
-  /////////////////////////////////////////////////////////////////////////////
-  //
-  /////////////////////////////////////////////////////////////////////////////
-  std::cout << "Start generating events" << std::endl;
-
   pythia.init();
 
-  // double counted cross section computed by MG5
-  const double mg5_xsec_pb = getMG5CrossSection(pythia);
+  /////////////////////////////////////////////////////////////////////////////
+  //
+  /////////////////////////////////////////////////////////////////////////////
+  const double mg5amcnlo_xsec = getMG5AMCNLOCrossSection(pythia);
+  // FIXME:
+  const long num_events = (max_events >= 0) ? max_events : countEvents(input_file_path);
 
-  const int max_abort = pythia.mode("Main:timesAllowErrors");
-  int num_abort = 0;
-  bool aborted = false;
+  const auto fail_tolerance = static_cast<uint32_t>(pythia.mode("Main:timesAllowErrors"));
+  uint32_t fail_count = 0;
 
-  while ((pythia.info.nSelected() < num_events) and (not aborted)) {
+  double xsec = 0.;
+  double xsec_error_squared = 0.;
+
+  std::cout << "Start generating events" << std::endl;
+
+  while (pythia.info.nSelected() < num_events) {
     const bool generation_okay = pythia.next();
 
-    if (generation_okay) {
-      if (pythia.info.weightValueByIndex() == 0) {
-        std::cerr << "got a zero-weight event" << std::endl;
-        continue;
-      }
-
-      if (pythia.event.size() < 3) {
-        std::cerr << "got a broken event: event.size()=" << pythia.event.size() << std::endl;
-        continue;
-      }
-
-    } else {
+    if (not generation_okay) {
       if (pythia.info.atEndOfFile()) {
-        std::cout << "reached the end of file" << std::endl;
+        std::cout << "reached the end of the file" << std::endl;
         break;
 
       } else {
-        ++num_abort;
-
-        if (num_abort >= max_abort) {
-          std::cerr << "exceeded the maximum number of failed generations" << std::endl;
-          aborted = true;
-          break;
-
-        } else {
-          std::cerr << "failed to generate an event. skip this event." << std::endl;
-          continue;
-
+        if (++fail_count >= fail_tolerance) {
+          throw std::runtime_error("aborted because of too many failures");
         }
+
+        continue;
       }
     }
 
@@ -180,56 +225,123 @@ int main(int argc, char* argv[]) {
     //
     ///////////////////////////////////////////////////////////////////////////
 
-    // norm = (mb/pb) / N = 1e-9 / N
-    // where
-    //   - N: the number of events in LHA
-    const double norm = getWeightNorm(pythia, mg5_xsec_pb, num_events);
-
-    // normally 1
+    // FIXME: rename
     const double central_weight = pythia.info.weight();
+    const double merging_weight = getMergingWeight(pythia, merging_hook);
+    const double weight = central_weight * merging_weight;
+    const double weight_norm = getEventWeightNormalizer(pythia, mg5amcnlo_xsec, num_events);
 
-    // central_weight * norm,
-    // where
-    //   - central_weight: normally 1
-    //   - norm: (mb/pb) / N
-    const double weight = central_weight * norm;
+    xsec += weight * weight_norm;
+    xsec_error_squared += std::pow(weight * weight_norm, 2);
 
-    pythia.info.weightContainerPtr->accumulateXsec(norm);
-    writer.setWeightNames(pythia.info.weightNameVector());
-    writer.writeNextEvent(pythia);
+    // protect against 0-weight from internal merging
+    if (std::abs(merging_weight) == 0) {
+      continue;
+    }
 
     ///////////////////////////////////////////////////////////////////////////
+    // write
+    ///////////////////////////////////////////////////////////////////////////
+
+    // hepmc
+    hepmc_writer.writeNextEvent(pythia);
+
     // djr
-    ///////////////////////////////////////////////////////////////////////////
+    if (do_matching and store_djr) {
+      const std::vector<double> djr_vec_src = matching_hook->getDJR();
+      djr_num_jets = matching_hook->nMEpartons().first;
+      djr_vec.clear();
+      djr_vec.resize(static_cast<int>(djr_vec_src.size()));
+      std::copy(djr_vec_src.begin(), djr_vec_src.end(), djr_vec.begin());
+      djr_weight = weight;
+      djr_tree->Fill();
+    }
+  } // generation loop
 
-    const std::vector<double> djr_vec_src = jet_matching->getDJR();
-    djr_num_jets = jet_matching->nMEpartons().first;
-    djr_vec.clear();
-    djr_vec.resize(static_cast<int>(djr_vec_src.size()));
-    std::copy(djr_vec_src.begin(), djr_vec_src.end(), djr_vec.begin());
-    djr_weight = weight;
-    djr_tree.Fill();
+  // NOTE: finalize
+  if (do_matching and store_djr) {
+    djr_file->Write();
+    djr_file->Close();
   }
 
-  /////////////////////////////////////////////////////////////////////////////
-  //
-  /////////////////////////////////////////////////////////////////////////////
+  // NOTE: report
+  const double xsec_error = std::sqrt(xsec_error_squared);
 
-  if (aborted) {
-    std::cerr << " Run was not completed owing to too many aborted events" << std::endl;
+  std::cout << "nSelected / nTotal = "
+            << pythia.info.nSelected() << " / " << num_events
+            << std::endl;
+
+  std::cout
+      << "MG5_aMC@NLO's cross section: "
+      << std::scientific << std::setprecision(8)
+      << mg5amcnlo_xsec << " pb"
+      << std::endl;
+
+  std::cout
+      << "Inclusive cross section: "
+      << std::scientific << std::setprecision(8)
+      << xsec * Pythia8::MB2PB
+      << "  +-  "
+      << xsec_error * Pythia8::MB2PB << " pb"
+      << std::endl;
+}
+
+
+// main
+int main(int argc, char* argv[]) {
+  argparse::ArgumentParser parser{"pythia8-hadronizer"};
+
+  parser.add_argument("-i", "--input")
+    .required()
+    .help("input LHE file");
+
+  parser.add_argument("-c", "--card")
+    .required()
+    .help("pythia8 card file");
+
+  parser.add_argument("-o", "--output")
+    .required()
+    .help("output HepMC3 file");
+
+  parser.add_argument("-n", "--max-events")
+    .scan<'d', long>()
+    .required()
+    .default_value(-1)
+    .help("if the value is negative, process all events");
+
+  parser.add_argument("--djr")
+    .flag()
+    .help("store djr into a ROOT file when JetMatching is used. The root file name will be derived from the output file name.");
+
+  try {
+    parser.parse_args(argc, argv);
+
+  } catch (const std::exception& err) {
+    std::cerr << "😱😱😱: " << err.what() << std::endl;
+    std::cerr << parser;
     return 1;
   }
 
-  pythia.stat();
 
-  const double sigm_total = pythia.info.weightContainerPtr->getTotalXsec().at(0) * mb_to_pb;
-  const double error_total = pythia.info.weightContainerPtr->getSampleXsecErr().at(0) * mb_to_pb;
+  try {
+    const fs::path input_file = parser.get<std::string>("input");
+    const fs::path card_file = parser.get<std::string>("card");
+    const fs::path output_file = parser.get<std::string>("output");
+    const long max_events = parser.get<long>("max-events");
+    const bool store_djr = parser.get<bool>("--djr");
 
-  std::cout << "MG5's double counted cross section: " << mg5_xsec_pb << " pb" << std::endl;
-  std::cout << "Inclusive cross section: " << sigm_total << "  +-  " << error_total << " pb " << std::endl;
+    run(
+      /*input_file=*/input_file,
+      /*card_file=*/card_file,
+      /*output_file=*/output_file,
+      /*max_events=*/max_events,
+      /*store_djr=*/store_djr
+    );
 
-  djr_file.Write();
-  djr_file.Close();
+  } catch (const std::exception& err) {
+    std::cerr << "😱😱😱: " << err.what() << std::endl;
+    return 1;
+  }
 
   return 0;
 }

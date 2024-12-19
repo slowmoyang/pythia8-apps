@@ -38,10 +38,16 @@ hepmc3_dep = declare_dependency(
     include_directories: hepmc3_include_directories,
 )
 
+argparse_dep = dependency(
+  'argparse',
+  required: true,
+)
+
 dependencies = [
   root_dep,
   pythia8_dep,
   hepmc3_dep,
+  argparse_dep,
 ]
 
 executable(

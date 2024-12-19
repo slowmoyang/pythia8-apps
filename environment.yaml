@@ -10,3 +10,4 @@ dependencies:
   - pythia8=8.312
   - hepmc3=3.3.0
   - clang-format=19.1.5
+  - just=1.38.0

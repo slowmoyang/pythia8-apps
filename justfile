@@ -7,7 +7,7 @@ help:
     just -l -f {{justfile()}}
 
 prefix := justfile_directory()
-install_dir := (prefix) / "install" # FIXME:
+install_dir := (prefix) / "install"
 
 alias s := setup
 setup:

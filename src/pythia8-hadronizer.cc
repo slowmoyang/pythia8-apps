@@ -306,7 +306,7 @@ int main(int argc, char* argv[]) {
   parser.add_argument("-n", "--max-events")
     .scan<'d', long>()
     .required()
-    .default_value(-1)
+    .default_value(-1l)
     .help("if the value is negative, process all events");
 
   parser.add_argument("--djr")
